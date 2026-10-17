@@ -810,6 +810,7 @@ const createCustomer = async (req, res) => {
       phone: phone || '',
       status: normalizedStatus,
       role: 'Customer',
+      profileCompleted: Boolean(phone),
       address: address || {
         street: '',
         complexOrBusinessHub: '',

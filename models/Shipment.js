@@ -122,7 +122,7 @@ const shipmentSchema = new mongoose.Schema({
   },
 
   // Fulfillment & Marketplace Details
-  orderNumber: String,
+  orderNumber: { type: String, index: true },
   marketplaceName: String,
   numberOfBoxes: { type: Number, default: 1 },
   parcels: [{
@@ -232,5 +232,35 @@ const shipmentSchema = new mongoose.Schema({
   {
     timestamps: true
   });
+
+// Every shipment gets an order number. Sellers can still supply their own store/marketplace
+// order number; when none is given we generate one like ORD-261013-7K3QX (date + random code).
+const generateOrderNumber = () => {
+  const now = new Date();
+  const date = [now.getFullYear() % 100, now.getMonth() + 1, now.getDate()]
+    .map((part) => String(part).padStart(2, '0'))
+    .join('');
+  const code = Math.random().toString(36).slice(2, 7).toUpperCase().padEnd(5, '0');
+  return `ORD-${date}-${code}`;
+};
+
+shipmentSchema.pre('validate', async function assignOrderNumber() {
+  if (this.orderNumber && String(this.orderNumber).trim()) {
+    this.orderNumber = String(this.orderNumber).trim();
+    return;
+  }
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const candidate = generateOrderNumber();
+    // eslint-disable-next-line no-await-in-loop
+    const taken = await this.constructor.exists({ orderNumber: candidate });
+    if (!taken) {
+      this.orderNumber = candidate;
+      return;
+    }
+  }
+  throw new Error('Could not generate a unique order number');
+});
+
+shipmentSchema.statics.generateOrderNumber = generateOrderNumber;
 
 module.exports = mongoose.model('Shipment', shipmentSchema);

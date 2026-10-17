@@ -1,0 +1,9 @@
+# Never upload secrets or local data to Vercel
+.env
+.env.*
+!.env.example
+node_modules
+uploads
+temp_email.txt
+*.log
+tests

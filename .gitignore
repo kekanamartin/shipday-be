@@ -42,3 +42,6 @@ firebase-adminsdk-*.json
 
 #zip files
 *.zip
+
+#files
+temp_email.txt

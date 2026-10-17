@@ -16,7 +16,7 @@ const userSchema = new mongoose.Schema(
     },
     role: {
       type: String,
-      enum: ['Super Admin', 'Admin', 'Manager', 'Admin Staff', 'Driver', 'Customer', 'Retail Hub'],
+      enum: ['Super Admin', 'Admin', 'Manager', 'Admin Staff', 'Driver', 'Customer', 'Retail Hub', 'Sales Representative'],
       default: 'Customer'
     },
     password: {
@@ -34,6 +34,35 @@ const userSchema = new mongoose.Schema(
     },
     companyName: String,
     fullName: String,
+    // false until the customer picks an account type and adds name/phone (Google sign-up, self-registration)
+    profileCompleted: Boolean,
+
+    // Referral & commission programme
+    referralCode: { type: String, unique: true, sparse: true, uppercase: true, trim: true },
+    referredBy: {
+      user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+      kind: { type: String, enum: ['SalesRep', 'Customer', null], default: null },
+      via: { type: String, enum: ['created', 'link', 'assigned', null], default: null },
+      at: { type: Date, default: null },
+    },
+    // Set when a Sales Representative creates the account: the customer agreed to the Terms and POPIA processing
+    consent: {
+      acceptedAt: { type: Date, default: null },
+      recordedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    },
+    // Only used for role 'Sales Representative'
+    repProfile: {
+      commissionActive: { type: Boolean, default: false },
+      activatedAt: { type: Date, default: null },
+      commissionRate: { type: Number, min: 0, default: null }, // null = use the programme rate
+      bank: {
+        bankName: String,
+        accountHolder: String,
+        accountNumber: String,
+        branchCode: String,
+        accountType: String,
+      },
+    },
     idNumber: {
       type: String,
       unique: true,

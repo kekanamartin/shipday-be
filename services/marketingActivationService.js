@@ -1,6 +1,5 @@
 const MarketingSettings = require('../models/MarketingSettings');
 const Shipment = require('../models/Shipment');
-const Staff = require('../models/Staff');
 const Transaction = require('../models/Transaction');
 const User = require('../models/User');
 const { evaluateCustomerActivation, getTopUpUserId } = require('../utils/marketingActivation');
@@ -72,16 +71,29 @@ async function refreshShipmentCustomerActivation(shipment) {
     ? null
     : await User.findOne({ email: shipment.senderDetails?.email }).select('_id');
   const userId = shipment.customer || user?._id;
-  return userId ? refreshCustomerActivation(userId) : null;
+  const activation = userId ? await refreshCustomerActivation(userId) : null;
+
+  // Pay rep commission / customer referral reward. Never let a payout problem block a delivery update.
+  if (shipment.status === 'Delivered') {
+    try {
+      // Required lazily: referralService is independent of this module
+      // eslint-disable-next-line global-require
+      await require('./referralService').handleShipmentDelivered(shipment);
+    } catch (err) {
+      console.error('Referral earnings error for shipment', shipment.shipmentId, err);
+    }
+  }
+
+  return activation;
 }
 
 async function getMarketingOverview() {
   const [settings, customers, representatives, transactions, deliveredShipments] = await Promise.all([
     getSettings(),
     User.find({ role: 'Customer' })
-      .select('customerId fullName companyName email phone salesRepresentative marketingActivation')
-      .populate('salesRepresentative', 'fullName email staffId role'),
-    Staff.find({ role: /^Sales Representative$/i }).select('fullName email staffId role'),
+      .select('customerId fullName companyName email phone accountType referredBy marketingActivation createdAt')
+      .populate('referredBy.user', 'fullName email role referralCode customerId repProfile.commissionActive'),
+    User.find({ role: 'Sales Representative' }).select('fullName email phone customerId status referralCode repProfile createdAt'),
     Transaction.find(TOP_UP_TRANSACTION_QUERY).select('userId orderId amount'),
     Shipment.find({ status: 'Delivered' }).select('customer senderDetails.email'),
   ]);
@@ -119,10 +131,15 @@ async function getMarketingOverview() {
       },
     });
 
+    const referrer = customer.referredBy?.user;
+    const repReferrer = customer.referredBy?.kind === 'SalesRep' ? referrer : null;
     return {
       ...customer.toObject(),
+      // Kept under the old name so the customers table keeps working
+      salesRepresentative: repReferrer ? { _id: repReferrer._id, fullName: repReferrer.fullName, staffId: repReferrer.customerId } : null,
+      referrerCustomer: customer.referredBy?.kind === 'Customer' && referrer ? { _id: referrer._id, fullName: referrer.fullName } : null,
       marketingActivation,
-      commissionEligible: Boolean(customer.salesRepresentative && progress.isActivated),
+      commissionEligible: Boolean(repReferrer && repReferrer.repProfile?.commissionActive && progress.isActivated),
     };
   });
 
@@ -132,8 +149,12 @@ async function getMarketingOverview() {
     settings: {
       minimumTopUpAmount: settings.minimumTopUpAmount,
       requiredSuccessfulShipments: settings.requiredSuccessfulShipments,
+      repCommissionAmount: settings.repCommissionAmount,
+      customerReferralReward: settings.customerReferralReward,
+      minimumPayoutAmount: settings.minimumPayoutAmount,
+      programmeEnabled: settings.programmeEnabled,
     },
-    representatives,
+    representatives: representatives.map(rep => ({ ...rep.toObject(), staffId: rep.customerId })),
     customers: customerRows,
   };
 }

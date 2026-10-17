@@ -30,4 +30,19 @@ const verifyAdmin = (req, res, next) => {
     }
 };
 
-module.exports = { verifySuperAdmin, verifyAdmin };
+const verifySalesRep = (req, res, next) => {
+    if (!req.user) {
+        return res.status(401).json({ message: 'Unauthorized: No user info' });
+    }
+    if (req.user.role === 'Sales Representative' && req.user.status !== 'Disabled') {
+        return next();
+    }
+    return res.status(403).json({ message: 'Forbidden: Sales Representative access required' });
+};
+
+const verifyCustomer = (req, res, next) => {
+    if (req.user?.role === 'Customer') return next();
+    return res.status(403).json({ message: 'Forbidden: customer accounts only' });
+};
+
+module.exports = { verifySuperAdmin, verifyAdmin, verifySalesRep, verifyCustomer };

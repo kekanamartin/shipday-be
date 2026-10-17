@@ -1,47 +1,67 @@
 const cors = require('cors');
 
-// Simplified CORS for Azure deployment
+// Origins that are always allowed (existing deployments and local development)
+const STATIC_ORIGINS = [
+  'https://lemon-moss-0af8f730f.1.azurestaticapps.net',
+  'https://shipday-be.vercel.app',
+  'http://192.168.0.54:8081',
+  'http://192.168.0.54:5000',
+];
+
+const trimSlash = (url) => String(url || '').trim().replace(/\/+$/, '');
+
+// Builds the allow-list from the environment on each check, so a redeploy isn't needed in tests.
+//   FRONTEND_URL / BASE_URL  the live frontend (www and non-www are both allowed)
+//   CORS_ORIGINS             extra origins, comma-separated; "*" matches one host label,
+//                            e.g. https://shipday-fe-*.vercel.app for Vercel preview deployments
+const allowedOriginMatchers = () => {
+  const exact = new Set(STATIC_ORIGINS);
+  const patterns = [];
+
+  [process.env.FRONTEND_URL, process.env.BASE_URL].filter(Boolean).forEach((value) => {
+    const url = trimSlash(value);
+    exact.add(url);
+    exact.add(url.includes('://www.') ? url.replace('://www.', '://') : url.replace('://', '://www.'));
+  });
+
+  String(process.env.CORS_ORIGINS || '')
+    .split(',')
+    .map(trimSlash)
+    .filter(Boolean)
+    .forEach((origin) => {
+      if (origin.includes('*')) {
+        const escaped = origin.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[a-z0-9-]+');
+        patterns.push(new RegExp(`^${escaped}$`, 'i'));
+      } else {
+        exact.add(origin);
+      }
+    });
+
+  return { exact, patterns };
+};
+
+const isAllowedOrigin = (origin) => {
+  if (!origin) return true; // mobile apps, curl, server-to-server
+  const value = trimSlash(origin);
+  if (/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(value)) return true;
+  const { exact, patterns } = allowedOriginMatchers();
+  return exact.has(value) || patterns.some((re) => re.test(value));
+};
+
+const originCheck = (origin, callback) => {
+  if (isAllowedOrigin(origin)) return callback(null, true);
+  console.error(`CORS Blocked Origin: ${origin}`);
+  return callback(new Error('Not allowed by CORS'));
+};
+
 const corsOptions = {
-  origin: (origin, callback) => {
-    // List of allowed origins
-    const allowedOrigins = [
-      'http://localhost:5173',
-      'http://127.0.0.1:5173',
-      'http://localhost:3000',
-      'https://lemon-moss-0af8f730f.1.azurestaticapps.net',
-      'https://shipday-be.vercel.app',
-      'http://192.168.0.54:8081',
-      'http://192.168.0.54:5000',
-      process.env.BASE_URL,
-      process.env.FRONTEND_URL
-    ].filter(Boolean);
-
-    // Dynamic check for production domain (with and without www)
-    if (process.env.BASE_URL) {
-      const baseUrl = process.env.BASE_URL.replace(/\/$/, ""); // Remove trailing slash
-      if (!allowedOrigins.includes(baseUrl)) allowedOrigins.push(baseUrl);
-
-      const wwwUrl = baseUrl.includes('www.') ? baseUrl.replace('www.', '') : baseUrl.replace('https://', 'https://www.');
-      if (!allowedOrigins.includes(wwwUrl)) allowedOrigins.push(wwwUrl);
-    }
-
-    // Allow requests with no origin (like mobile apps or curl)
-    if (!origin) return callback(null, true);
-
-    const isLocal = origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1');
-    const isAllowed = allowedOrigins.some(allowedOrigin => origin === allowedOrigin || origin.startsWith(allowedOrigin));
-
-    if (isAllowed || isLocal) {
-      callback(null, true);
-    } else {
-      console.error(`CORS Blocked Origin: ${origin}`);
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
+  origin: originCheck,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'X-API-Key', 'Idempotency-Key'],
   credentials: true,
-  optionsSuccessStatus: 200
+  optionsSuccessStatus: 200,
 };
 
 module.exports = cors(corsOptions);
+module.exports.isAllowedOrigin = isAllowedOrigin;
+module.exports.originCheck = originCheck;

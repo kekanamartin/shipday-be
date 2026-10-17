@@ -37,6 +37,8 @@ router.use('/pricing', pricingRoutes); // New Route
 router.use('/v1/store', storeIntegrationRoutes);
 router.use('/v1/courier-partner', courierPartnerApiRoutes);
 router.use('/marketing', marketingRoutes);
+router.use('/sales-rep', require('./salesRep'));
+router.use('/referrals', require('./referral'));
 router.use('/shipments', shipmentsRoutes);
 router.use('/verification', verificationRoutes);
 router.use('/payments', paymentRoutes);

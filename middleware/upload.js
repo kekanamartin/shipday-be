@@ -2,49 +2,68 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 
-// Create uploads directories if they don't exist
-const uploadDir = 'uploads/id-proofs';
-const driverImageDir = 'uploads/driver-images';
-const walletSupportDir = 'uploads/wallet-supporting-documents';
+/*
+ * File uploads.
+ *
+ * Multer keeps each upload in memory, then `persist` stores it and sets `file.path`, which is the
+ * only field the controllers read:
+ *   - disk (default for a normal server): written under uploads/<folder>/, `file.path` = that path
+ *   - inline (default on Vercel, whose file system is read-only): `file.path` = a data: URL saved
+ *     in the database record, so the file still works without any file storage service
+ * Set FILE_STORAGE=disk or FILE_STORAGE=inline to choose explicitly.
+ *
+ * Note: Vercel rejects request bodies over 4.5 MB, so uploads larger than that fail there.
+ */
+const useInlineStorage = () =>
+  (process.env.FILE_STORAGE || (process.env.VERCEL ? 'inline' : 'disk')).toLowerCase() === 'inline';
 
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
-}
+const uniqueName = (prefix, originalname) =>
+  `${prefix}-${Date.now()}-${Math.round(Math.random() * 1e9)}${path.extname(originalname || '')}`;
 
-if (!fs.existsSync(driverImageDir)) {
-  fs.mkdirSync(driverImageDir, { recursive: true });
-}
+// Where each form field is stored and how it is named on disk
+const FIELD_RULES = {
+  driverImage: { dir: 'uploads/driver-images', prefix: 'driver-image' },
+  idProof: { dir: 'uploads/id-proofs', prefix: 'id-proof' },
+  supportingDocument: { dir: 'uploads/wallet-supporting-documents', prefix: 'wallet-support' },
+};
+const podRule = (field) => ({ dir: 'uploads/pod', prefix: `pod-${field}` });
 
-if (!fs.existsSync(walletSupportDir)) {
-  fs.mkdirSync(walletSupportDir, { recursive: true });
-}
-
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    if (file.fieldname === 'driverImage') {
-      cb(null, driverImageDir);
-    } else {
-      cb(null, uploadDir);
-    }
-  },
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    if (file.fieldname === 'driverImage') {
-      cb(null, 'driver-image-' + uniqueSuffix + path.extname(file.originalname));
-    } else {
-      cb(null, 'id-proof-' + uniqueSuffix + path.extname(file.originalname));
-    }
+const saveFile = async (file, rule) => {
+  if (useInlineStorage()) {
+    file.path = `data:${file.mimetype || 'application/octet-stream'};base64,${file.buffer.toString('base64')}`;
+    file.filename = uniqueName(rule.prefix, file.originalname);
+    return;
   }
-});
+  await fs.promises.mkdir(rule.dir, { recursive: true });
+  const filename = uniqueName(rule.prefix, file.originalname);
+  const filePath = path.join(rule.dir, filename);
+  await fs.promises.writeFile(filePath, file.buffer);
+  file.path = filePath;
+  file.filename = filename;
+  file.destination = rule.dir;
+};
 
-const fileFilter = (req, file, cb) => {
-  // Accept images only
-  if (file.mimetype.startsWith('image/')) {
-    cb(null, true);
-  } else {
-    cb(new Error('Only image files are allowed!'), false);
+// Runs after multer and stores every file it received
+const persist = (ruleFor) => async (req, res, next) => {
+  try {
+    const files = [];
+    if (req.file) files.push(req.file);
+    if (req.files) {
+      Object.values(Array.isArray(req.files) ? { files: req.files } : req.files).forEach((list) => files.push(...list));
+    }
+    for (const file of files) {
+      // eslint-disable-next-line no-await-in-loop
+      await saveFile(file, ruleFor(file.fieldname));
+    }
+    next();
+  } catch (err) {
+    next(err);
   }
+};
+
+const imageFilter = (req, file, cb) => {
+  if (file.mimetype.startsWith('image/')) cb(null, true);
+  else cb(new Error('Only image files are allowed!'), false);
 };
 
 const walletSupportFileFilter = (req, file, cb) => {
@@ -55,75 +74,41 @@ const walletSupportFileFilter = (req, file, cb) => {
     'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     'application/vnd.ms-excel',
     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    'text/plain'
+    'text/plain',
   ];
-
-  const isAllowed = allowedMimeTypes.some(type => file.mimetype.startsWith(type));
-  if (isAllowed) {
-    cb(null, true);
-  } else {
-    cb(new Error('Only image, PDF, Word, Excel, and text files are allowed!'), false);
-  }
+  if (allowedMimeTypes.some((type) => file.mimetype.startsWith(type))) cb(null, true);
+  else cb(new Error('Only image, PDF, Word, Excel, and text files are allowed!'), false);
 };
 
-const upload = multer({
-  storage: storage,
-  fileFilter: fileFilter,
-  limits: {
-    fileSize: 5 * 1024 * 1024 // 5MB limit
-  }
+const memory = multer.memoryStorage();
+const defaultRule = (field) => FIELD_RULES[field] || FIELD_RULES.idProof;
+
+// Same interface as a multer instance (.single / .fields / .array), each returning [multer, persist]
+const withPersist = (instance, ruleFor) => ({
+  single: (name) => [instance.single(name), persist(ruleFor)],
+  fields: (fields) => [instance.fields(fields), persist(ruleFor)],
+  array: (name, max) => [instance.array(name, max), persist(ruleFor)],
 });
 
-const walletSupportStorage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, walletSupportDir);
-  },
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, 'wallet-support-' + uniqueSuffix + path.extname(file.originalname));
-  }
-});
+const upload = withPersist(
+  multer({ storage: memory, fileFilter: imageFilter, limits: { fileSize: 5 * 1024 * 1024 } }),
+  defaultRule
+);
 
-const walletSupportUpload = multer({
-  storage: walletSupportStorage,
-  fileFilter: walletSupportFileFilter,
-  limits: {
-    fileSize: 10 * 1024 * 1024 // 10MB limit for supporting documents
-  }
-});
+const walletSupportUpload = withPersist(
+  multer({ storage: memory, fileFilter: walletSupportFileFilter, limits: { fileSize: 10 * 1024 * 1024 } }),
+  () => FIELD_RULES.supportingDocument
+);
 
-// Upload configuration for driver registration (multiple fields)
-const driverRegistrationUpload = multer({
-  storage: storage,
-  fileFilter: fileFilter,
-  limits: {
-    fileSize: 5 * 1024 * 1024 // 5MB limit per file
-  }
-}).fields([
+const podUpload = withPersist(
+  multer({ storage: memory, limits: { fileSize: 10 * 1024 * 1024 } }),
+  podRule
+);
+
+// Driver registration: driver photo + ID proof
+const driverRegistrationUpload = upload.fields([
   { name: 'driverImage', maxCount: 1 },
-  { name: 'idProof', maxCount: 1 }
+  { name: 'idProof', maxCount: 1 },
 ]);
-
-// POD upload config
-const podStorage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    const dir = 'uploads/pod';
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    cb(null, dir);
-  },
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, 'pod-' + file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
-  }
-});
-
-const podUpload = multer({
-  storage: podStorage,
-  limits: {
-    fileSize: 10 * 1024 * 1024 // 10MB limit for POD files
-  }
-});
 
 module.exports = { upload, podUpload, driverRegistrationUpload, walletSupportUpload };

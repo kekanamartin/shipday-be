@@ -9,6 +9,7 @@ const Wallet = require('../models/Wallet');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
+const { resolveReferrer, referralRecord, generateReferralCode, SALES_REP_ROLE } = require('../services/referralService');
 
 // Password strength regex
 const strongPasswordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[\W_]).{8,}$/;
@@ -87,12 +88,51 @@ const generateCustomerId = async () => {
   return `CUST${padded}`;
 };
 
+// Generate unique Sales Representative ID (REP001, REP002, ...)
+const generateRepId = async () => {
+  let next = (await User.countDocuments({ customerId: /^REP\d+$/ })) + 1;
+  // Counting can collide after deletions, so step forward until the ID is free
+  while (await User.exists({ customerId: `REP${String(next).padStart(3, '0')}` })) next += 1;
+  return `REP${String(next).padStart(3, '0')}`;
+};
+
 // Generate unique Admin ID
 const generateAdminId = async () => {
   const count = await User.countDocuments({ customerId: /^ADMIN/ });
   const nextNumber = count + 1; // e.g. if 1 exists (ADMIN001), next is 2
   const padded = String(nextNumber).padStart(3, '0');
   return `ADMIN${padded}`;
+};
+
+// Customers must choose an account type and provide name/phone before using the dashboard
+const needsProfileSetup = (user) => {
+  if ((user.role || 'Customer') !== 'Customer') return false;
+  if (user.profileCompleted === true) return false;
+  if (user.profileCompleted === false) return true;
+  // Legacy accounts: prompt only when details are missing
+  return !user.fullName || !user.phone || user.$isDefault('accountType')
+    || (user.accountType === 'Business' && !user.companyName);
+};
+
+const buildAuthUser = (user) => ({
+  email: user.email,
+  fullName: user.fullName,
+  customerId: user.customerId,
+  role: user.role || 'Customer',
+  image: user.image,
+  phone: user.phone || '',
+  accountType: user.accountType,
+  companyName: user.companyName || '',
+  needsProfileSetup: needsProfileSetup(user),
+});
+
+// South African numbers: accepts 082 123 4567, +27 82 123 4567, 27821234567 or 0027 82 123 4567,
+// and stores them in the 10-digit local format (0821234567) used across existing records
+const saPhoneRegex = /^0[1-8]\d{8}$/;
+const normalizePhone = (phone) => {
+  const digits = String(phone || '').replace(/[\s().-]/g, '');
+  const local = digits.replace(/^(?:\+27|0027|27)(?=\d{9}$)/, '0');
+  return local;
 };
 
 // Request verification code
@@ -160,7 +200,7 @@ const verifyCode = async (req, res) => {
 
 // Register user
 const registerUser = async (req, res) => {
-  const { email, password, code } = req.body;
+  const { email, password, code, referralCode } = req.body;
   const sanitizedEmail = validateEmail(email);
 
   if (!sanitizedEmail || !password || !code)
@@ -197,7 +237,11 @@ const registerUser = async (req, res) => {
       email: sanitizedEmail,
       password: hashedPassword,
       customerId,
+      profileCompleted: false,
     });
+
+    const referrer = referralCode ? await resolveReferrer(referralCode, { email: sanitizedEmail }) : null;
+    if (referrer) user.referredBy = referralRecord(referrer, 'link');
 
     await user.save();
 
@@ -237,7 +281,7 @@ const registerUser = async (req, res) => {
       message: 'User registered successfully',
       customerId,
       token,
-      user: { email: user.email, customerId: user.customerId, role: user.role || 'Customer' }
+      user: buildAuthUser(user)
     });
   } catch (err) {
     console.error(err);
@@ -256,10 +300,14 @@ const loginUser = async (req, res) => {
 
   try {
     const user = await User.findOne({ email: sanitizedEmail });
-    if (!user) return res.status(401).json({ message: 'Invalid credentials' });
+    if (!user) return res.status(401).json({ message: 'Incorrect email or password.' });
 
     const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) return res.status(401).json({ message: 'Invalid credentials' });
+    if (!isMatch) return res.status(401).json({ message: 'Incorrect email or password.' });
+
+    if (user.role === SALES_REP_ROLE && user.status === 'Disabled') {
+      return res.status(403).json({ message: 'This account has been disabled. Please contact ShipDay.' });
+    }
 
     const token = jwt.sign({ id: user._id, email: user.email, role: user.role || 'Customer' }, process.env.JWT_SECRET, { expiresIn: '2h' });
 
@@ -275,7 +323,7 @@ const loginUser = async (req, res) => {
     res.status(200).json({
       message: 'Login successful',
       token,
-      user: { email: user.email, customerId: user.customerId },
+      user: buildAuthUser(user),
     });
   } catch (err) {
     console.error(err);
@@ -353,9 +401,10 @@ const updateUserProfile = async (req, res) => {
     accountOwnerIdNumber,
     businessRegistrationNumber,
   } = req.body;
-  const sanitizedEmail = validateEmail(email || req.user?.email);
+  // Only the signed-in user's own profile can be changed here
+  const sanitizedEmail = validateEmail(req.user?.email);
 
-  if (!sanitizedEmail) return res.status(400).json({ message: 'Valid email is required' });
+  if (!sanitizedEmail) return res.status(401).json({ message: 'Please sign in to update your profile' });
 
   try {
     const user = await User.findOne({ email: sanitizedEmail });
@@ -410,7 +459,7 @@ const updateUserProfile = async (req, res) => {
 const generateAutoIdNumber = async () => {
   for (let attempt = 0; attempt < 1000; attempt += 1) {
     const candidate = String(Math.floor(100 + Math.random() * 900));
-    const existing = await User.findOne({ idNumber: candidate });
+    const existing = await User.findOne({ $or: [{ idNumber: candidate }, { accountOwnerIdNumber: candidate }] });
     if (!existing) {
       return candidate;
     }
@@ -426,7 +475,7 @@ const completeProfileSetup = async (req, res) => {
     fullName,
     companyName,
     businessRegistrationNumber,
-    idNumber,
+    phone,
   } = req.body;
 
   if (!userId) {
@@ -438,8 +487,14 @@ const completeProfileSetup = async (req, res) => {
   const trimmedCompanyName = String(companyName || '').trim();
   const trimmedBusinessRegistrationNumber = businessRegistrationNumber === undefined || businessRegistrationNumber === null ? '' : String(businessRegistrationNumber).trim();
 
+  const normalizedPhone = normalizePhone(phone);
+
   if (!trimmedFullName) {
     return res.status(400).json({ message: 'Full name is required' });
+  }
+
+  if (!saPhoneRegex.test(normalizedPhone)) {
+    return res.status(400).json({ message: 'Please enter a valid South African phone number, e.g. 082 123 4567' });
   }
 
   if (normalizedAccountType === 'Business') {
@@ -466,37 +521,37 @@ const completeProfileSetup = async (req, res) => {
 
     user.accountType = normalizedAccountType;
     user.fullName = trimmedFullName;
+    user.phone = normalizedPhone;
     user.companyName = normalizedAccountType === 'Business' ? trimmedCompanyName : '';
     user.businessRegistrationNumber = normalizedAccountType === 'Business' ? trimmedBusinessRegistrationNumber : undefined;
-    user.accountOwnerIdNumber = undefined;
 
+    // Keep an existing ID when re-running setup; otherwise assign a unique 3-digit one
+    const existingId = user.idNumber || user.accountOwnerIdNumber;
+    const assignedId = existingId || await generateAutoIdNumber();
     if (normalizedAccountType === 'Personal') {
-      let generatedIdNumber = idNumber && /^\d{3}$/.test(String(idNumber).trim()) ? String(idNumber).trim() : user.idNumber;
-      if (!generatedIdNumber || !/^\d{3}$/.test(generatedIdNumber)) {
-        generatedIdNumber = await generateAutoIdNumber();
-      }
-
-      const duplicateId = await User.findOne({ idNumber: generatedIdNumber, _id: { $ne: userId } });
-      if (duplicateId) {
-        generatedIdNumber = await generateAutoIdNumber();
-      }
-
-      user.idNumber = generatedIdNumber;
+      user.idNumber = assignedId;
+      user.accountOwnerIdNumber = undefined;
     } else {
+      user.accountOwnerIdNumber = assignedId;
       user.idNumber = undefined;
     }
 
+    user.profileCompleted = true;
+
+    // A referral from someone with the same phone number is a self-referral: drop it
+    if (user.referredBy?.user) {
+      const referrer = await User.findById(user.referredBy.user).select('phone');
+      if (referrer?.phone && referrer.phone === normalizedPhone) {
+        user.referredBy = { user: null, kind: null, via: null, at: null };
+      }
+    }
     await user.save();
 
     res.status(200).json({
       message: 'Account setup complete',
       user: {
-        email: user.email,
-        fullName: user.fullName,
-        customerId: user.customerId,
-        accountType: user.accountType,
-        companyName: user.companyName,
-        idNumber: user.idNumber || '',
+        ...buildAuthUser(user),
+        idNumber: user.idNumber || user.accountOwnerIdNumber || '',
       }
     });
   } catch (err) {
@@ -562,7 +617,7 @@ const getUserByEmail = async (req, res) => {
 //  Get all customers
 const getAllCustomers = async (req, res) => {
   try {
-    const users = await User.find().select('customerId fullName email phone companyName status location address role idNumber accountOwnerIdNumber businessRegistrationNumber');
+    const users = await User.find().select('customerId fullName email phone accountType companyName status location address role idNumber accountOwnerIdNumber businessRegistrationNumber');
     const orders = await Order.find();
     const wallets = await Wallet.find();
     const requesterRole = (req.user?.role || '').toLowerCase().replace(/\s/g, '');
@@ -582,6 +637,7 @@ const getAllCustomers = async (req, res) => {
         fullName: user.fullName,
         email: user.email,
         phone: user.phone,
+        accountType: user.accountType || 'Personal',
         company: user.companyName || '',
         status: user.status || 'Active',
         location: user.location || {},
@@ -603,6 +659,108 @@ const getAllCustomers = async (req, res) => {
   } catch (error) {
     console.error("Error fetching customers", error);
     res.status(500).json({ message: "Internal server error" });
+  }
+};
+
+// Current user's own profile (customer "My Profile" page)
+const getMyProfile = async (req, res) => {
+  try {
+    const user = req.user;
+    const [wallet, totalOrders] = await Promise.all([
+      Wallet.findOne({ userId: user._id }).select('balance'),
+      Order.countDocuments({
+        $or: [
+          { senderEmail: user.email },
+          ...(user.phone ? [{ senderPhone: user.phone }] : []),
+        ],
+      }),
+    ]);
+
+    res.status(200).json({
+      profile: {
+        customerId: user.customerId,
+        email: user.email,
+        fullName: user.fullName || '',
+        phone: user.phone || '',
+        image: user.image || '',
+        role: user.role || 'Customer',
+        status: user.status || 'Active',
+        accountType: user.accountType || 'Personal',
+        companyName: user.companyName || '',
+        idNumber: user.idNumber || user.accountOwnerIdNumber || '',
+        businessRegistrationNumber: user.businessRegistrationNumber || '',
+        address: user.address || {},
+        memberSince: user.createdAt,
+        walletBalance: wallet ? wallet.balance : 0,
+        totalOrders,
+      },
+    });
+  } catch (err) {
+    console.error('Get my profile error:', err);
+    res.status(500).json({ message: 'Server error while loading your profile' });
+  }
+};
+
+const SA_PROVINCES = [
+  'Eastern Cape', 'Free State', 'Gauteng', 'KwaZulu-Natal', 'Limpopo',
+  'Mpumalanga', 'North West', 'Northern Cape', 'Western Cape',
+];
+
+// Customers can update their own name, phone and address
+const updateMyProfile = async (req, res) => {
+  const { fullName, phone, address } = req.body;
+  const user = req.user;
+
+  try {
+    if (fullName !== undefined) {
+      const trimmed = String(fullName).trim();
+      if (!trimmed) return res.status(400).json({ message: 'Full name cannot be empty' });
+      user.fullName = trimmed;
+    }
+
+    if (phone !== undefined) {
+      const normalizedPhone = normalizePhone(phone);
+      if (!saPhoneRegex.test(normalizedPhone)) {
+        return res.status(400).json({ message: 'Please enter a valid South African phone number, e.g. 082 123 4567' });
+      }
+      user.phone = normalizedPhone;
+    }
+
+    if (address !== undefined) {
+      const clean = (value) => String(value || '').trim();
+      const next = {
+        street: clean(address.street),
+        complexOrBusinessHub: clean(address.complexOrBusinessHub),
+        city: clean(address.city),
+        province: clean(address.province),
+        postalCode: clean(address.postalCode),
+      };
+
+      if (!next.street || !next.city || !next.province || !next.postalCode) {
+        return res.status(400).json({ message: 'Street, city, province and postal code are required' });
+      }
+      if (!SA_PROVINCES.includes(next.province)) {
+        return res.status(400).json({ message: 'Please choose a South African province' });
+      }
+      if (!/^\d{4}$/.test(next.postalCode)) {
+        return res.status(400).json({ message: 'Postal code must be 4 digits' });
+      }
+
+      const current = user.address || {};
+      const changed = ['street', 'complexOrBusinessHub', 'city', 'province', 'postalCode']
+        .some((key) => (current[key] || '') !== next[key]);
+
+      if (changed) {
+        // Old GPS coordinates no longer match the new address
+        user.address = { ...next, country: 'South Africa' };
+      }
+    }
+
+    await user.save();
+    return getMyProfile(req, res);
+  } catch (err) {
+    console.error('Update my profile error:', err);
+    res.status(500).json({ message: 'Server error while updating your profile' });
   }
 };
 
@@ -651,7 +809,7 @@ const getCustomerById = async (req, res) => {
 
 // Google Login
 const googleLogin = async (req, res) => {
-  const { email, fullName, image } = req.body;
+  const { email, fullName, image, referralCode } = req.body;
   const sanitizedEmail = validateEmail(email);
   if (!sanitizedEmail) return res.status(400).json({ message: "Valid email is required" });
 
@@ -668,7 +826,11 @@ const googleLogin = async (req, res) => {
         image: base64Image,
         customerId,
         password: await bcrypt.hash(Math.random().toString(36), 10),
+        profileCompleted: false,
       });
+      // Referral links only count for brand-new accounts
+      const referrer = referralCode ? await resolveReferrer(referralCode, { email: sanitizedEmail }) : null;
+      if (referrer) user.referredBy = referralRecord(referrer, 'link');
       await user.save();
     } else {
       if (!user.image || !user.image.startsWith("data:image")) {
@@ -691,12 +853,7 @@ const googleLogin = async (req, res) => {
     res.status(200).json({
       message: "Google login successful",
       token,
-      user: {
-        email: user.email,
-        fullName: user.fullName,
-        customerId: user.customerId,
-        image: user.image,
-      },
+      user: buildAuthUser(user),
     });
   } catch (err) {
     console.error("Google login error:", err);
@@ -721,14 +878,20 @@ const convertImageToBase64 = async (url) => {
 
 // Create Admin/Staff User (Super Admin only)
 const createAdminUser = async (req, res) => {
-  const { email, password, fullName, role } = req.body;
+  const { email, password, fullName, role, phone } = req.body;
   const sanitizedEmail = validateEmail(email);
 
   if (!sanitizedEmail || !password || !fullName)
     return res.status(400).json({ message: 'Valid email, password, and name are required' });
 
-  if (!['Admin', 'Manager', 'Admin Staff'].includes(role)) {
+  if (!['Admin', 'Manager', 'Admin Staff', SALES_REP_ROLE].includes(role)) {
     return res.status(400).json({ message: 'Invalid role for admin creation' });
+  }
+
+  const isRep = role === SALES_REP_ROLE;
+  const normalizedPhone = phone ? normalizePhone(phone) : '';
+  if (isRep && !saPhoneRegex.test(normalizedPhone)) {
+    return res.status(400).json({ message: 'Please enter a valid South African phone number for the sales representative' });
   }
 
   try {
@@ -736,7 +899,7 @@ const createAdminUser = async (req, res) => {
     if (existingUser)
       return res.status(400).json({ message: 'User already exists' });
 
-    const customerId = await generateAdminId();
+    const customerId = isRep ? await generateRepId() : await generateAdminId();
     const hashedPassword = await bcrypt.hash(password, 10);
 
     // Create direct user with Role
@@ -745,8 +908,10 @@ const createAdminUser = async (req, res) => {
       password: hashedPassword,
       fullName: fullName,
       customerId,
-      role: role // Explicitly set role
+      role: role, // Explicitly set role
+      ...(isRep ? { phone: normalizedPhone, repProfile: { commissionActive: false } } : {}),
     });
+    if (isRep) user.referralCode = await generateReferralCode(user);
 
     await user.save();
 
@@ -813,6 +978,12 @@ module.exports = {
   resetPassword,
   updateUserProfile,
   completeProfileSetup,
+  getMyProfile,
+  updateMyProfile,
+  generateCustomerId,
+  generateAutoIdNumber,
+  normalizePhone,
+  saPhoneRegex,
   saveUserLocation,
   getUserByEmail,
   getAllCustomers,

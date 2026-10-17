@@ -9,6 +9,8 @@ const {
   verifyCode,
   updateUserProfile,
   completeProfileSetup,
+  getMyProfile,
+  updateMyProfile,
   getUserByEmail,
   getAllCustomers,
   googleLogin,
@@ -36,7 +38,9 @@ router.post('/verification/verify', verifyCode);
 
 // User profile routes
 router.get('/profile', authMiddleware, getUserByEmail);
-router.patch('/profile', updateUserProfile);
+router.get('/me', authMiddleware, getMyProfile);
+router.patch('/me', authMiddleware, updateMyProfile);
+router.patch('/profile', authMiddleware, updateUserProfile);
 router.post('/profile/setup', authMiddleware, completeProfileSetup);
 
 // This matches the frontend call /api/user?email=... if mounted at /api
