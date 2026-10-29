@@ -6,6 +6,8 @@ const {
   requestVerificationCode,
   logoutUser,
   resetPassword,
+  setPassword,
+  checkPasswordLink,
   verifyCode,
   updateUserProfile,
   completeProfileSetup,
@@ -19,6 +21,7 @@ const {
   updateUserByAdmin // Import this
 } = require('../controller/auth');
 
+const { requirePermission } = require('../middleware/access');
 const authMiddleware = require('../middleware/authMiddleware');
 const { verifySuperAdmin } = require('../middleware/roleMiddleware');
 
@@ -29,6 +32,9 @@ router.post('/google-login', googleLogin);
 router.post('/create-admin', authMiddleware, verifySuperAdmin, createAdminUser); // Protected route
 router.post('/logout', authMiddleware, logoutUser);
 router.post('/reset-password', resetPassword);
+router.get('/set-password', checkPasswordLink);
+router.post('/set-password', setPassword);
+router.get('/access', authMiddleware, require('../controller/permission').getMyAccess);
 router.delete('/delete/:id', authMiddleware, verifySuperAdmin, deleteUser); // Delete user route
 router.put('/update-user/:id', authMiddleware, verifySuperAdmin, updateUserByAdmin); // Update user route
 
@@ -51,6 +57,6 @@ router.post('/profile/setup', authMiddleware, completeProfileSetup);
 // For now, I will add it to index.js as a quick fix or create a transform.
 
 // Customer routes
-router.get('/customers', getAllCustomers);
+router.get('/customers', authMiddleware, requirePermission('customers.view'), getAllCustomers);
 
 module.exports = router;

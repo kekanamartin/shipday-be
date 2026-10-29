@@ -191,6 +191,14 @@ const shipmentSchema = new mongoose.Schema({
   },
   dateShipped: { type: Date, default: Date.now },
   deliveredAt: { type: Date },
+
+  // The hub that booked or handles the shipment, and that hub plus every hub above it.
+  // A hub user sees shipments whose hubPath contains their hub.
+  hub: { type: mongoose.Schema.Types.ObjectId, ref: 'Hub', default: null, index: true },
+  hubPath: { type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Hub' }], index: true },
+  // First time the shipment left for collection or delivery, and when it went back to the sender
+  dispatchedAt: { type: Date, index: true },
+  returnedAt: { type: Date },
   orders: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Order' }],
   routeId: { type: String },
   trackingNumber: { type: String },
@@ -262,5 +270,72 @@ shipmentSchema.pre('validate', async function assignOrderNumber() {
 });
 
 shipmentSchema.statics.generateOrderNumber = generateOrderNumber;
+
+// New shipments without a hub go to the Regional Hub of the province they're collected from.
+// (Shipments booked by a hub team are given that hub when they're created.)
+shipmentSchema.pre('validate', async function assignHub() {
+  if (!this.isNew) return;
+  // eslint-disable-next-line global-require
+  const { hubPathFor, regionalHubFor } = require('../services/hubAssignment');
+  if (this.hub && !(this.hubPath && this.hubPath.length)) {
+    this.hubPath = await hubPathFor(this.hub);
+    return;
+  }
+  if (this.hub) return;
+  const hub = await regionalHubFor(this.collectionDetails?.address?.province || this.senderDetails?.address?.province);
+  if (hub) {
+    this.hub = hub._id;
+    this.hubPath = [hub._id];
+  }
+});
+
+// Status groups used by the hub dashboards
+const DISPATCHED_STATUSES = [
+  'Picked Up', 'Collected', 'In Transit', 'Inter Hub', 'Inter branch Transit',
+  'Out For Delivery', 'Out for Delivery', 'Shipping',
+];
+const RETURN_STATUSES = ['Return to Sender', 'Returning to hub'];
+const PENDING_DISPATCH_STATUSES = [
+  'Order Created', 'Pending Collection', 'Pending Delivery', 'Driver Assigned', 'Assigned', 'Pending',
+  'Arrived at Hub', 'At Warehouse', 'Parcel in Sorting Facility', 'On Hold',
+];
+
+// Record when a shipment is first dispatched, delivered or returned, however its status is changed
+const STATUS_TIMES = [
+  ['dispatchedAt', DISPATCHED_STATUSES],
+  ['deliveredAt', ['Delivered']],
+  ['returnedAt', RETURN_STATUSES],
+];
+
+shipmentSchema.pre('save', function recordStatusTimes() {
+  if (!this.isModified('status')) return;
+  STATUS_TIMES.forEach(([field, statuses]) => {
+    if (statuses.includes(this.status) && !this[field]) this[field] = new Date();
+  });
+});
+
+function recordStatusTimesOnUpdate() {
+  const update = this.getUpdate();
+  if (!update || Array.isArray(update)) return;
+  const status = update.$set?.status ?? update.status;
+  if (!status) return;
+  const touched = (field) => [update, update.$set, update.$min, update.$setOnInsert, update.$unset]
+    .some((part) => part && Object.prototype.hasOwnProperty.call(part, field));
+  STATUS_TIMES.forEach(([field, statuses]) => {
+    // $min keeps the earliest time if it was already recorded
+    if (statuses.includes(status) && !touched(field)) {
+      update.$min = { ...(update.$min || {}), [field]: new Date() };
+    }
+  });
+  this.setUpdate(update);
+}
+
+shipmentSchema.pre('findOneAndUpdate', recordStatusTimesOnUpdate);
+shipmentSchema.pre('updateOne', recordStatusTimesOnUpdate);
+shipmentSchema.pre('updateMany', recordStatusTimesOnUpdate);
+
+shipmentSchema.statics.DISPATCHED_STATUSES = DISPATCHED_STATUSES;
+shipmentSchema.statics.RETURN_STATUSES = RETURN_STATUSES;
+shipmentSchema.statics.PENDING_DISPATCH_STATUSES = PENDING_DISPATCH_STATUSES;
 
 module.exports = mongoose.model('Shipment', shipmentSchema);

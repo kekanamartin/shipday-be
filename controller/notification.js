@@ -1,6 +1,10 @@
 const Notification = require('../models/Notification');
 const User = require('../models/User');
 const sendMail = require('../utils/mail');
+const { isStaff } = require('../middleware/access');
+
+// Staff see every notification (system alerts included); everyone else only their own
+const visibleTo = (user) => (isStaff(user) ? {} : { userId: user._id });
 
 // Replaced local transporter with unified mail utility for Gmail consistency
 
@@ -44,7 +48,7 @@ exports.createNotification = async (req, res) => {
 // Get all notifications, newest first, with user fullName populated
 exports.getNotifications = async (req, res) => {
   try {
-    const notifications = await Notification.find()
+    const notifications = await Notification.find(visibleTo(req.user))
       .sort({ createdAt: -1 })
       .populate('userId', 'fullName'); // populate only fullName from User
     res.json(notifications);
@@ -56,17 +60,17 @@ exports.getNotifications = async (req, res) => {
 // Mark one notification as read
 exports.markAsRead = async (req, res) => {
   try {
-    await Notification.findByIdAndUpdate(req.params.id, { isRead: true });
+    await Notification.updateOne({ _id: req.params.id, ...visibleTo(req.user) }, { isRead: true });
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 };
 
-// Clear all notifications from DB
+// Clear the notifications this user can see
 exports.clearAllNotifications = async (req, res) => {
   try {
-    await Notification.deleteMany({});
+    await Notification.deleteMany(visibleTo(req.user));
     res.json({ success: true, message: "All notifications cleared" });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });

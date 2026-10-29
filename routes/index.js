@@ -28,9 +28,12 @@ const storeIntegrationRoutes = require('./storeIntegration');
 const courierPartnerApiRoutes = require('./courierPartnerApi');
 
 // Use routes
-router.get('/user', authController.getUserByEmail); // Fix for missing /api/user route
-router.get('/user/:id', authController.getUserById); // Get user by _id
-router.get('/customers', authController.getAllCustomers); // Fix for missing /api/customers route
+const authMiddleware = require('../middleware/authMiddleware');
+const { requirePermission } = require('../middleware/access');
+
+router.get('/user', authMiddleware, authController.getUserByEmail); // Your own account, or any for staff
+router.get('/user/:id', authMiddleware, authController.getUserById); // Your own account, or any for staff
+router.get('/customers', authMiddleware, requirePermission('customers.view'), authController.getAllCustomers);
 router.use('/auth', authRoutes);
 router.use('/admin', adminRoutes);
 router.use('/pricing', pricingRoutes); // New Route
@@ -56,5 +59,8 @@ router.use('/notifications', notificationRoutes);
 router.use('/wallets', walletRoutes);
 router.use('/drivers', driverRoutes);
 router.use('/contact', contactRoutes);
+router.use('/hubs', require('./hubs'));
+router.use('/team', require('./team'));
+router.use('/permissions', require('./permissions'));
 
 module.exports = router;

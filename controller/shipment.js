@@ -6,6 +6,7 @@ const generateShipmentId = require('../utils/generateShipmentId');
 const isWithinRadius = require('../utils/isWithinRadius');
 const { sendShipmentStatusEmail } = require('../utils/shipmentEmailTemplates');
 const { refreshShipmentCustomerActivation } = require('../services/marketingActivationService');
+const { isStaff, isHubUser, loadPermissions, canAccessShipment, limitShipment } = require('../middleware/access');
 
 
 function getRandomStatus() {
@@ -154,11 +155,21 @@ exports.getAllShipments = async (req, res) => {
           { 'deliveryDetails.email': email },
           { 'receiverEmail': email }
         ];
+      } else if (isHubUser(req.user) && req.user.hub) {
+        // Hub teams see their own area; with ?scope=all, other hubs' shipments too (limited details)
+        const permissions = await loadPermissions(req);
+        if (!permissions.includes('shipments.view')) return res.status(403).json({ message: "You don't have permission to do this." });
+        if (!(req.query.scope === 'all' && permissions.includes('shipments.view_other_hubs'))) {
+          query['$or'] = [{ hubPath: req.user.hub }, { customer: _id }];
+        }
       } else if (role === 'Driver') {
         // Driver sees assigned shipments
         query.driver = _id;
+      } else if (!isStaff(req.user)) {
+        // Anyone else (e.g. Retail Hub, Sales Representative) sees only shipments they booked
+        query['$or'] = [{ customer: _id }, { 'senderDetails.email': email }, { 'senderEmail': email }];
       }
-      // Admins and Managers see all
+      // Staff see all
     }
 
     const shipments = await Shipment.find(query)
@@ -173,7 +184,10 @@ exports.getAllShipments = async (req, res) => {
 
     // Update driverName for shipments with assigned drivers
     const updatedShipments = shipments.map(shipment => {
-      const shipmentObj = shipment.toObject();
+      // Shipments from outside a hub user's area only show the customer name and order details
+      const shipmentObj = isHubUser(req.user) && !canAccessShipment(req.user, shipment)
+        ? limitShipment(shipment)
+        : shipment.toObject();
       if (shipmentObj.driver && shipmentObj.driver.username) {
         shipmentObj.driverName = shipmentObj.driver.username;
       }

@@ -10,17 +10,19 @@ const {
 } = require('../controller/shipment');
 const { createShipment, getShipmentById, updateShipment, downloadWaybill, downloadPOD } = require('../controller/admin');
 const authMiddleware = require('../middleware/authMiddleware');
+const { requirePermission } = require('../middleware/access');
 
 // Shipment routes
-router.post('/generate', authMiddleware, generateShipments);
-router.patch('/orders/status', authMiddleware, updateOrderStatus);
-router.get('/metrics', authMiddleware, getShipmentMetrics);
-router.get('/status-breakdown', authMiddleware, getShipmentStatusBreakdown);
+// Company-wide tools and figures: head office only
+router.post('/generate', authMiddleware, requirePermission('dashboard.company'), requirePermission('shipments.edit'), generateShipments);
+router.patch('/orders/status', authMiddleware, requirePermission('dashboard.company'), requirePermission('shipments.edit'), updateOrderStatus);
+router.get('/metrics', authMiddleware, requirePermission('dashboard.company'), getShipmentMetrics);
+router.get('/status-breakdown', authMiddleware, requirePermission('dashboard.company'), getShipmentStatusBreakdown);
 router.get('/track/:trackingNumber', trackShipment); // Public tracking route
 router.get('/', authMiddleware, getAllShipments);
 router.post('/', authMiddleware, createShipment);
-router.get('/:shipmentId', authMiddleware, getShipmentById);
-router.put('/:shipmentId', authMiddleware, updateShipment);
+router.get('/:shipmentId', authMiddleware, getShipmentById); // checks access itself
+router.put('/:shipmentId', authMiddleware, requirePermission('shipments.edit'), updateShipment); // can set status; hub teams only in their area
 router.get('/:shipmentId/waybill', authMiddleware, downloadWaybill);
 router.get('/:shipmentId/pod', authMiddleware, downloadPOD);
 

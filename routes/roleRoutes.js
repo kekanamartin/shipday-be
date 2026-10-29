@@ -8,7 +8,7 @@ const { verifyAdmin } = require('../middleware/roleMiddleware');
 router.post('/', authMiddleware, verifyAdmin, roleController.createRole);
 
 // GET all roles
-router.get('/', roleController.getRoles);
+router.get('/', authMiddleware, roleController.getRoles);
 // PUT update role
 router.put('/:id', authMiddleware, verifyAdmin, roleController.updateRole);
 

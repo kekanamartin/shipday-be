@@ -16,9 +16,26 @@ const userSchema = new mongoose.Schema(
     },
     role: {
       type: String,
-      enum: ['Super Admin', 'Admin', 'Manager', 'Admin Staff', 'Driver', 'Customer', 'Retail Hub', 'Sales Representative'],
+      enum: [
+        'Super Admin', 'Admin', 'Manager', 'Admin Staff', 'Accounts Manager',
+        'Regional Manager', 'Sub-Region Manager', 'Retail Hub Manager', 'Hub Staff',
+        'Driver', 'Customer', 'Retail Hub', 'Sales Representative',
+      ],
       default: 'Customer'
     },
+    // Hub roles work at one hub and see that hub and the hubs below it; head office has no hub
+    hub: { type: mongoose.Schema.Types.ObjectId, ref: 'Hub', default: null, index: true },
+    employment: {
+      jobTitle: String,
+      idOrPassport: String,
+      startDate: Date,
+    },
+    // Team members set their own password from an emailed link
+    invite: {
+      sentAt: { type: Date, default: null },
+      acceptedAt: { type: Date, default: null },
+    },
+    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     password: {
       type: String,
       required: true,

@@ -13,10 +13,12 @@ const Transaction = require('../models/Transaction');
 const Shipment = require('../models/Shipment');
 const User = require('../models/User');
 const { refreshCustomerActivation } = require('../services/marketingActivationService');
+const { canAccessShipment, isStaff } = require('../middleware/access');
 
 exports.createPaymentIntent = async (req, res) => {
   try {
-    const { amount, userId } = req.body;
+    const { amount } = req.body;
+    const userId = req.user._id;
 
     if (!amount || isNaN(amount)) {
       return res.status(400).json({ error: 'Amount is required and must be a number' });
@@ -60,7 +62,84 @@ exports.createPaymentIntent = async (req, res) => {
   }
 };
 
-const { generatePaymentData, pfValidSignature } = require('../utils/payfast');
+const { generatePaymentData, pfValidSignature, payfastMode, isPayFastIp, confirmWithPayFast } = require('../utils/payfast');
+const mongoose = require('mongoose');
+
+const toRand = (value) => Math.round(parseFloat(value) * 100) / 100;
+const isDuplicateKey = (err) => err && err.code === 11000;
+
+// A shipment by its database _id or its public shipment number
+const findShipment = (id) => {
+  const value = String(id || '').trim();
+  if (!value) return null;
+  return Shipment.findOne(mongoose.Types.ObjectId.isValid(value) ? { _id: value } : { shipmentId: value });
+};
+
+// Credit a PayFast top-up once. The Transaction (unique txnId) is written first,
+// so a repeated notification for the same payment can't credit the wallet twice.
+// Returns false if this payment was already recorded.
+const creditTopUp = async ({ userId, amount, txnId, orderId, customer, description }) => {
+  try {
+    await Transaction.create({ txnId, customer, userId, type: 'Credit', orderId, amount, method: 'PayFast', status: 'Completed' });
+  } catch (err) {
+    if (isDuplicateKey(err)) return false;
+    throw err;
+  }
+
+  try {
+    await Wallet.findOneAndUpdate(
+      { userId },
+      { $inc: { balance: amount }, $push: { transactions: { type: 'credit', amount, description, date: new Date() } } },
+      { new: true, upsert: true }
+    );
+  } catch (err) {
+    // Undo the record so PayFast's retry can try again
+    await Transaction.deleteOne({ txnId }).catch(() => {});
+    throw err;
+  }
+
+  await Notification.create({
+    userId,
+    title: 'Wallet Recharged',
+    message: `R${amount.toFixed(2)} has been credited to your wallet.`,
+    type: 'transaction'
+  });
+  await refreshCustomerActivation(userId);
+  return true;
+};
+
+// Mark a shipment paid once. Returns the shipment, or null if it was already paid.
+const markShipmentPaid = async (shipment, { amount, txnId, method, customer }) => {
+  const updated = await Shipment.findOneAndUpdate(
+    { _id: shipment._id, 'payment.status': { $ne: 'paid' } },
+    { $set: { 'payment.status': 'paid', 'payment.transactionId': txnId, 'payment.amount': amount } },
+    { new: true }
+  );
+  if (!updated) return null;
+
+  const user = updated.customer
+    ? await User.findById(updated.customer).select('_id')
+    : await User.findOne({ email: updated.senderDetails?.email }).select('_id');
+
+  await Transaction.create({
+    txnId,
+    customer: customer || updated.senderDetails?.fullName,
+    userId: user?._id,
+    type: 'Debit',
+    orderId: updated.shipmentId,
+    amount,
+    method,
+    status: 'Completed'
+  }).catch((err) => { if (!isDuplicateKey(err)) throw err; });
+
+  await Notification.create({
+    userId: user ? user._id : null,
+    title: 'Payment Received',
+    message: `Payment of R${amount.toFixed(2)} received for Shipment ${updated.shipmentId}`,
+    type: 'transaction'
+  });
+  return updated;
+};
 
 exports.initiatePayFastPayment = async (req, res) => {
   try {
@@ -70,9 +149,12 @@ exports.initiatePayFastPayment = async (req, res) => {
       return res.status(400).json({ message: 'Shipment ID is required' });
     }
 
-    const shipment = await Shipment.findById(shipmentId);
-    if (!shipment) {
+    const shipment = await findShipment(shipmentId);
+    if (!shipment || !canAccessShipment(req.user, shipment)) {
       return res.status(404).json({ message: 'Shipment not found' });
+    }
+    if (shipment.payment?.status === 'paid') {
+      return res.status(400).json({ message: 'This shipment is already paid' });
     }
 
     const paymentInfo = generatePaymentData(shipment);
@@ -89,6 +171,7 @@ exports.initiatePayFastPayment = async (req, res) => {
 
     res.status(200).json({
       redirectUrl,
+      paymentId: paymentInfo.data.m_payment_id,
       paymentData: paymentInfo.data // Sending data just in case frontend wants to use form POST later
     });
 
@@ -98,24 +181,25 @@ exports.initiatePayFastPayment = async (req, res) => {
   }
 };
 
+// Top up the signed-in user's own wallet
 exports.initiateWalletTopup = async (req, res) => {
   try {
-    const { userId, amount } = req.body;
-
-    if (!userId || !amount) {
-      return res.status(400).json({ message: 'User ID and Amount are required' });
+    const amount = toRand(req.body.amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ message: 'Enter an amount more than zero' });
     }
 
-    const user = await User.findById(userId);
+    const user = req.user;
+    const paymentId = `TOPUP-${user._id}-${Date.now()}`;
 
     // Mocking shipment for PayFast generator
     const mockShipment = {
-      shipmentId: `TOPUP-${userId}-${Date.now()}`,
+      shipmentId: paymentId,
       senderDetails: {
-        fullName: user?.fullName || 'User',
-        email: user?.email || 'user@example.com'
+        fullName: user.fullName || 'ShipDay Customer',
+        email: user.email
       },
-      payment: { amount: parseFloat(amount) },
+      payment: { amount },
       parcelDetails: { serviceType: 'Wallet Top-up' }
     };
 
@@ -129,7 +213,8 @@ exports.initiateWalletTopup = async (req, res) => {
     }
 
     res.status(200).json({
-      redirectUrl: `${paymentInfo.url}?${queryParams.toString()}`
+      redirectUrl: `${paymentInfo.url}?${queryParams.toString()}`,
+      paymentId
     });
 
   } catch (error) {
@@ -138,83 +223,55 @@ exports.initiateWalletTopup = async (req, res) => {
   }
 };
 
+// PayFast's Instant Transaction Notification (ITN). Every check must pass before money moves:
+// signature, sender address, merchant, PayFast's own confirmation, amount, and not already processed.
 exports.handlePayFastNotify = async (req, res) => {
   try {
-    const pfData = req.body;
-
+    const pfData = req.body || {};
+    const reject = (reason) => {
+      console.error(`❌ PayFast ITN rejected (${pfData.m_payment_id || 'no reference'}): ${reason}`);
+      return res.status(400).send('Rejected');
+    };
 
     const checkSignature = pfValidSignature(pfData, process.env.PAYFAST_PASSPHRASE);
-    if (pfData.signature !== checkSignature) {
-      console.error("❌ Invalid PayFast Signature");
-      return res.status(400).send('Invalid Signature');
-    }
+    if (!pfData.signature || pfData.signature !== checkSignature) return reject('invalid signature');
 
-    const mPaymentId = pfData.m_payment_id;
-    const paymentStatus = pfData.payment_status;
-    const amountGross = parseFloat(pfData.amount_gross);
+    if (!(await isPayFastIp(req.ip))) return reject(`not sent from a PayFast address (${req.ip})`);
 
-    if (paymentStatus === 'COMPLETE') {
-      if (mPaymentId.startsWith('TOPUP-')) {
-        // WALLET TOPUP FLOW
-        const parts = mPaymentId.split('-');
-        const userId = parts[1];
+    const merchantId = (process.env.PAYFAST_MERCHANT_ID || '10045256').trim();
+    if (String(pfData.merchant_id || '').trim() !== merchantId) return reject('wrong merchant');
 
-        const existingTopUp = await Transaction.findOne({ txnId: pfData.pf_payment_id });
-        if (existingTopUp) return res.status(200).send('OK');
+    if (!(await confirmWithPayFast(pfData))) return reject('PayFast did not confirm the payment');
 
-        let wallet = await Wallet.findOne({ userId });
-        if (!wallet) {
-          wallet = new Wallet({ userId, balance: 0, transactions: [] });
-        }
+    const mPaymentId = String(pfData.m_payment_id || '');
+    const amountGross = toRand(pfData.amount_gross);
+    if (!Number.isFinite(amountGross) || amountGross <= 0) return reject('invalid amount');
 
-        wallet.balance += amountGross;
-        wallet.transactions.push({
-          type: 'credit',
-          amount: amountGross,
-          description: `Wallet Deposit via PayFast (Ref: ${pfData.pf_payment_id})`,
-          date: new Date()
-        });
-        await wallet.save();
+    // Only completed payments move money; PayFast also notifies about cancelled/failed ones
+    if (pfData.payment_status !== 'COMPLETE') return res.status(200).send('OK');
 
-        await Transaction.create({
-          txnId: pfData.pf_payment_id,
-          customer: pfData.name_first + ' ' + pfData.name_last,
-          userId: userId, // Link to user account
-          type: 'Credit',
-          orderId: mPaymentId,
-          amount: amountGross,
-          method: 'PayFast',
-          status: 'Completed'
-        });
-
-        await Notification.create({
-          userId: userId,
-          title: 'Wallet Recharged',
-          message: `R${amountGross} has been successfully credited to your wallet.`,
-          type: 'transaction'
-        });
-        await refreshCustomerActivation(userId);
-
-      } else {
-        // SHIPMENT PAYMENT FLOW
-        const shipment = await Shipment.findOne({ shipmentId: mPaymentId });
-        if (shipment) {
-          shipment.payment.status = 'paid';
-          shipment.payment.transactionId = pfData.pf_payment_id;
-          shipment.payment.amount = amountGross;
-          await shipment.save();
-
-          // Try to find the user by email to get their ObjectId for the notification
-          const user = await User.findOne({ email: shipment.senderDetails.email });
-
-          await Notification.create({
-            userId: user ? user._id : null,
-            title: 'Payment Received',
-            message: `Payment of R${amountGross} received for Shipment ${mPaymentId}`,
-            type: 'transaction'
-          });
-        }
+    if (mPaymentId.startsWith('TOPUP-')) {
+      // WALLET TOPUP FLOW
+      const userId = mPaymentId.split('-')[1];
+      if (!mongoose.Types.ObjectId.isValid(userId) || !(await User.exists({ _id: userId }))) {
+        return reject('unknown user');
       }
+      await creditTopUp({
+        userId,
+        amount: amountGross,
+        txnId: pfData.pf_payment_id,
+        orderId: mPaymentId,
+        customer: `${pfData.name_first || ''} ${pfData.name_last || ''}`.trim(),
+        description: `Wallet Deposit via PayFast (Ref: ${pfData.pf_payment_id})`
+      });
+    } else {
+      // SHIPMENT PAYMENT FLOW
+      const shipment = await Shipment.findOne({ shipmentId: mPaymentId });
+      if (!shipment) return reject('unknown shipment');
+      if (Math.abs(toRand(shipment.payment?.amount) - amountGross) > 0.01) {
+        return reject(`amount R${amountGross} does not match shipment total R${shipment.payment?.amount}`);
+      }
+      await markShipmentPaid(shipment, { amount: amountGross, txnId: pfData.pf_payment_id, method: 'PayFast' });
     }
 
     res.status(200).send('OK');
@@ -224,129 +281,68 @@ exports.handlePayFastNotify = async (req, res) => {
   }
 };
 
-// Helper to manually trigger notify logic for sandbox/local testing
+// Sandbox only: PayFast can't reach a local backend, so the success page confirms the payment itself.
+// Never available unless PAYFAST_MODE is explicitly "sandbox".
 exports.confirmSandboxPayment = async (req, res) => {
   try {
-    const { mPaymentId, amount } = req.body;
-    const numAmount = parseFloat(amount);
-    const mongoose = require('mongoose');
-
-    // Safety check - ONLY allow in sandbox mode
-    const mode = (process.env.PAYFAST_MODE || 'sandbox').trim().toLowerCase();
-    if (mode !== 'sandbox') {
+    if ((process.env.PAYFAST_MODE || '').trim().toLowerCase() !== 'sandbox' || payfastMode() !== 'sandbox') {
       return res.status(403).json({ message: 'Manual confirmation only allowed in sandbox mode' });
     }
 
-
-
-    // Check if already processed to prevent double-charging in Sandbox
-    const existingTransaction = await Transaction.findOne({ orderId: mPaymentId, status: 'Completed' });
-    if (existingTransaction) {
-
-      return res.status(200).json({ message: 'Sandbox payment already synchronized' });
-    }
-
-    // Reuse notify logic but with deterministic pfData for idempotent sandbox sync
-    const mockPfData = {
-      m_payment_id: mPaymentId,
-      payment_status: 'COMPLETE',
-      amount_gross: amount,
-      pf_payment_id: `MOCK-${mPaymentId}`, // Deterministic ID prevents duplicates via DB unique index
-      name_first: 'Sandbox',
-      name_last: 'Tester'
-    };
+    const mPaymentId = String(req.body.mPaymentId || '');
 
     if (mPaymentId.startsWith('TOPUP-')) {
-      const parts = mPaymentId.split('-');
-      const userIdStr = parts[1];
-
-      if (!mongoose.Types.ObjectId.isValid(userIdStr)) {
-        console.error('❌ Invalid User ID structure in mPaymentId:', userIdStr);
+      const userId = mPaymentId.split('-')[1];
+      if (!mongoose.Types.ObjectId.isValid(userId)) {
         return res.status(400).json({ message: 'Invalid User ID structure' });
       }
-
-      const userId = new mongoose.Types.ObjectId(userIdStr);
-
-      // Use findOneAndUpdate with $inc and $push for atomic safety
-      const updatedWallet = await Wallet.findOneAndUpdate(
-        { userId },
-        {
-          $inc: { balance: numAmount },
-          $push: {
-            transactions: {
-              type: 'credit',
-              amount: numAmount,
-              description: `Wallet Deposit (Auto-Sync Sandbox)`,
-              date: new Date()
-            }
-          }
-        },
-        { new: true, upsert: true }
-      );
-
-      await Transaction.create({
-        txnId: mockPfData.pf_payment_id,
-        customer: 'Sandbox Tester',
-        userId,
-        type: 'Credit',
-        orderId: mPaymentId,
-        amount: numAmount,
-        method: 'PayFast',
-        status: 'Completed'
-      });
-
-      await refreshCustomerActivation(userId);
-
-      await Notification.create({
-        userId: userId,
-        title: 'Wallet Recharged (Sandbox)',
-        message: `R${numAmount} has been credited via sandbox auto-sync.`,
-        type: 'transaction'
-      });
-    } else {
-      const shipment = await Shipment.findOne({ shipmentId: mPaymentId });
-      if (shipment) {
-        shipment.payment.status = 'paid';
-        shipment.payment.transactionId = mockPfData.pf_payment_id;
-        shipment.payment.amount = parseFloat(amount);
-        await shipment.save();
-
-        const user = await User.findOne({ email: shipment.senderDetails.email });
-        await Notification.create({
-          userId: user ? user._id : null,
-          title: 'Payment Received (Sandbox)',
-          message: `Payment of R${amount} confirmed via sandbox auto-sync.`,
-          type: 'transaction'
-        });
-
-        await Transaction.create({
-          txnId: mockPfData.pf_payment_id,
-          customer: shipment.senderDetails.fullName || 'Sandbox Tester',
-          type: 'Debit',
-          orderId: mPaymentId,
-          amount: parseFloat(amount),
-          method: 'PayFast',
-          status: 'Completed'
-        });
+      if (String(userId) !== String(req.user._id)) {
+        return res.status(403).json({ message: 'You can only confirm your own top-up.' });
       }
+      const amount = toRand(req.body.amount);
+      if (!Number.isFinite(amount) || amount <= 0 || amount > 100000) {
+        return res.status(400).json({ message: 'Invalid amount' });
+      }
+      const credited = await creditTopUp({
+        userId: req.user._id,
+        amount,
+        txnId: `MOCK-${mPaymentId}`, // Deterministic ID: confirming twice is a no-op
+        orderId: mPaymentId,
+        customer: req.user.fullName || req.user.email,
+        description: 'Wallet Deposit (Sandbox)'
+      });
+      return res.status(200).json({ message: credited ? 'Sandbox payment synchronized successfully' : 'Sandbox payment already synchronized' });
     }
 
-    res.status(200).json({ message: 'Sandbox payment synchronized successfully' });
+    const shipment = await findShipment(mPaymentId);
+    if (!shipment || !canAccessShipment(req.user, shipment)) {
+      return res.status(404).json({ message: 'Shipment not found' });
+    }
+    // The amount always comes from the shipment, never from the browser
+    const paid = await markShipmentPaid(shipment, {
+      amount: toRand(shipment.payment?.amount || 0),
+      txnId: `MOCK-${shipment.shipmentId}`,
+      method: 'PayFast'
+    });
+    res.status(200).json({ message: paid ? 'Sandbox payment synchronized successfully' : 'Sandbox payment already synchronized' });
   } catch (err) {
     console.error('❌ Sandbox Confirm Error:', err);
     res.status(500).json({ message: 'Internal Server Error' });
   }
 };
+
+// Pay for a shipment from an e-wallet. Customers always pay from their own wallet;
+// staff paying on a customer's behalf use that shipment's customer's wallet.
 exports.payWithWallet = async (req, res) => {
   try {
-    const { shipmentId, userId } = req.body;
+    const { shipmentId } = req.body;
 
-    if (!shipmentId || !userId) {
-      return res.status(400).json({ message: 'Shipment ID and User ID are required' });
+    if (!shipmentId) {
+      return res.status(400).json({ message: 'Shipment ID is required' });
     }
 
-    const shipment = await Shipment.findById(shipmentId);
-    if (!shipment) {
+    const shipment = await findShipment(shipmentId);
+    if (!shipment || !canAccessShipment(req.user, shipment)) {
       return res.status(404).json({ message: 'Shipment not found' });
     }
 
@@ -354,20 +350,34 @@ exports.payWithWallet = async (req, res) => {
       return res.status(400).json({ message: 'This shipment is already paid' });
     }
 
-    let wallet = await Wallet.findOne({ userId });
-    if (!wallet) {
-      return res.status(404).json({ message: 'Wallet not found' });
+    let payerId = req.user._id;
+    if (isStaff(req.user)) {
+      const owner = shipment.customer
+        ? await User.findById(shipment.customer).select('_id')
+        : await User.findOne({ email: shipment.senderDetails?.email }).select('_id');
+      if (!owner) return res.status(400).json({ message: "This shipment isn't linked to a customer account with a wallet" });
+      payerId = owner._id;
     }
 
-    const amount = shipment.payment.amount;
-
-    if (wallet.balance < amount) {
-      return res.status(400).json({ message: 'Insufficient wallet balance' });
+    const amount = toRand(shipment.payment.amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ message: 'This shipment has no amount to pay' });
     }
 
-    // Atomic update to prevent race conditions
+    // Claim the shipment first so two clicks can't charge twice
+    const transactionId = `WLT-${Date.now()}`;
+    const claimed = await Shipment.findOneAndUpdate(
+      { _id: shipment._id, 'payment.status': { $ne: 'paid' } },
+      { $set: { 'payment.status': 'paid', 'payment.method': 'ewallet', 'payment.transactionId': transactionId } },
+      { new: true }
+    );
+    if (!claimed) {
+      return res.status(400).json({ message: 'This shipment is already paid' });
+    }
+
+    // Atomic: only debits while the balance covers the amount
     const updatedWallet = await Wallet.findOneAndUpdate(
-      { userId },
+      { userId: payerId, balance: { $gte: amount } },
       {
         $inc: { balance: -amount },
         $push: {
@@ -382,15 +392,19 @@ exports.payWithWallet = async (req, res) => {
       { new: true }
     );
 
-    shipment.payment.status = 'paid';
-    shipment.payment.method = 'ewallet';
-    shipment.payment.transactionId = `WLT-${Date.now()}`;
-    await shipment.save();
+    if (!updatedWallet) {
+      // Release the shipment again
+      await Shipment.updateOne(
+        { _id: shipment._id, 'payment.transactionId': transactionId },
+        { $set: { 'payment.status': shipment.payment.status || 'pending', 'payment.method': shipment.payment.method, 'payment.transactionId': shipment.payment.transactionId } }
+      );
+      return res.status(400).json({ message: 'Insufficient wallet balance' });
+    }
 
     const newTransaction = new Transaction({
-      txnId: shipment.payment.transactionId,
+      txnId: transactionId,
       customer: shipment.senderDetails.fullName,
-      userId: userId, // Link to user account
+      userId: payerId, // Link to user account
       type: 'Debit',
       orderId: shipment.shipmentId,
       amount: amount,
@@ -401,15 +415,15 @@ exports.payWithWallet = async (req, res) => {
 
     // Push notification/record - non-blocking
     Notification.create({
-      userId: userId,
+      userId: payerId,
       title: 'Payment Successful',
-      message: `Your payment of R${amount} for Shipment ${shipment.shipmentId} has been deducted from your wallet.`,
+      message: `Your payment of R${amount.toFixed(2)} for Shipment ${shipment.shipmentId} has been deducted from your wallet.`,
       type: 'transaction'
     }).catch(e => console.error("Async Notify Error:", e));
 
     res.status(200).json({
       message: 'Payment successful',
-      transactionId: shipment.payment.transactionId,
+      transactionId,
       newBalance: updatedWallet.balance
     });
 

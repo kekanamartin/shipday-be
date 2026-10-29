@@ -6,6 +6,8 @@ const Status = require('../models/Status');
 const Pricing = require('../models/Pricing');
 const { calculateShipmentPricing } = require('../utils/shipmentPricing');
 const { refreshShipmentCustomerActivation } = require('../services/marketingActivationService');
+const { canAccessShipment, shipmentAccess, limitShipment, isHubUser } = require('../middleware/access');
+const { hubFieldsForBooking } = require('../services/hubAssignment');
 // Trigger server restart for logic update
 const { sendPushNotification } = require('../utils/pushNotification');
 const { sendShipmentStatusEmail } = require('../utils/shipmentEmailTemplates');
@@ -196,11 +198,14 @@ const createShipment = async (req, res) => {
 
     let pricingBreakdown = null;
     let shipmentAmount = 0;
+    // Shared by the pricing step and the detailed shipment record below
+    let pricingDimensions = [];
+    let shipmentBoxCount = 1;
 
     if (senderDetails && collectionDetails && deliveryDetails && parcelDetails) {
       const pricing = await Pricing.findOne() || new Pricing();
       const requestedPackaging = parcelDetails.packaging ?? selectedPackaging ?? [];
-      const pricingDimensions = Array.isArray(parcels) && parcels.length > 0
+      pricingDimensions = Array.isArray(parcels) && parcels.length > 0
         ? parcels
         : Array.isArray(parcelDetails.dimensions)
           ? parcelDetails.dimensions
@@ -219,7 +224,7 @@ const createShipment = async (req, res) => {
       ) {
         return res.status(400).json({ message: 'numberOfBoxes must match the number of parcel dimensions' });
       }
-      const shipmentBoxCount = isFulfillment
+      shipmentBoxCount = isFulfillment
         ? numberOfBoxes ?? Math.max(pricingDimensions.length, 1)
         : Math.max(pricingDimensions.length, Number(numberOfBoxes) || 1);
 
@@ -354,6 +359,9 @@ const createShipment = async (req, res) => {
     }
 
 
+
+    // Shipments booked by a hub team belong to that hub
+    Object.assign(shipmentData, await hubFieldsForBooking(req.user));
 
     const shipment = new Shipment(shipmentData);
     await shipment.save();
@@ -568,11 +576,13 @@ const getShipmentById = async (req, res) => {
         options: { strictPopulate: false }
       });
 
-    if (!shipment) {
+    const access = shipment ? await shipmentAccess(req, shipment) : null;
+    if (!access) {
       return res.status(404).json({ message: 'Shipment not found' });
     }
 
-    res.status(200).json({ shipment });
+    // Another hub's shipment: customer name and order details only
+    res.status(200).json({ shipment: access === 'limited' ? limitShipment(shipment) : shipment });
   } catch (err) {
     console.error('Error fetching shipment:', err);
     res.status(500).json({ message: 'Server error', error: err.message });
@@ -608,7 +618,8 @@ const getAllShipments = async (req, res) => {
 
 // Update shipment details
 const updateShipment = async (req, res) => {
-  const { shipmentId, senderName, senderPhone, receiverName, receiverPhone, start, end, parcelWeight, packageType, cost, eta, notes, status } = req.body;
+  const shipmentId = req.params.shipmentId || req.body.shipmentId;
+  const { senderName, senderPhone, receiverName, receiverPhone, start, end, parcelWeight, packageType, cost, eta, notes, status } = req.body;
 
   if (!shipmentId) {
     return res.status(400).json({ message: 'shipmentId is required' });
@@ -628,6 +639,14 @@ const updateShipment = async (req, res) => {
     if (eta) updateData.eta = new Date(eta);
     if (notes !== undefined) updateData.notes = notes;
     if (status) updateData.status = status;
+
+    // Hub teams can only change shipments in their own area
+    if (isHubUser(req.user)) {
+      const existing = await Shipment.findOne({ shipmentId }).select('hubPath customer');
+      if (!existing || !canAccessShipment(req.user, existing)) {
+        return res.status(404).json({ message: 'Shipment not found' });
+      }
+    }
 
     const shipment = await Shipment.findOneAndUpdate(
       { shipmentId },
@@ -685,7 +704,7 @@ const downloadWaybill = async (req, res) => {
   const { shipmentId } = req.params;
   try {
     const shipment = await Shipment.findOne({ shipmentId });
-    if (!shipment) {
+    if (!shipment || !canAccessShipment(req.user, shipment)) {
       return res.status(404).json({ message: 'Shipment not found' });
     }
 
@@ -704,7 +723,7 @@ const downloadPOD = async (req, res) => {
   const { shipmentId } = req.params;
   try {
     const shipment = await Shipment.findOne({ shipmentId });
-    if (!shipment) {
+    if (!shipment || !canAccessShipment(req.user, shipment)) {
       return res.status(404).json({ message: 'Shipment not found' });
     }
 

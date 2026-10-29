@@ -10,6 +10,11 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 const { resolveReferrer, referralRecord, generateReferralCode, SALES_REP_ROLE } = require('../services/referralService');
+const { verifyGoogleAccessToken, GoogleAuthError } = require('../utils/googleAuth');
+const { isStaff, isHubUser } = require('../middleware/access');
+const Hub = require('../models/Hub');
+const { permissionsForRole } = require('../services/permissionService');
+const { verifyPasswordToken, signPasswordToken, PasswordTokenError } = require('../services/accountTokens');
 
 // Password strength regex
 const strongPasswordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[\W_]).{8,}$/;
@@ -33,7 +38,7 @@ const sendVerificationCode = async (email) => {
 
   await VerificationCode.findOneAndUpdate(
     { email },
-    { code, expiresAt },
+    { code, expiresAt, attempts: 0 },
     { upsert: true, new: true }
   );
 
@@ -124,7 +129,27 @@ const buildAuthUser = (user) => ({
   accountType: user.accountType,
   companyName: user.companyName || '',
   needsProfileSetup: needsProfileSetup(user),
+  hub: user.hub || null,
 });
+
+// The signed-in user plus what they're allowed to do, for the menu
+const buildSignedInUser = async (user) => ({
+  ...buildAuthUser(user),
+  permissions: await permissionsForRole(user.role),
+});
+
+// Reasons an account can't sign in right now (null when it can)
+const signInBlock = async (user) => {
+  if (user.status === 'Disabled') return 'This account has been disabled. Please contact ShipDay.';
+  // Older 'Retail Hub' logins made before hubs existed keep working until they're linked to a hub
+  if (isHubUser(user) && !(user.role === 'Retail Hub' && !user.hub)) {
+    const hub = user.hub ? await Hub.findById(user.hub).select('name status') : null;
+    if (!hub) return "Your login isn't linked to a hub yet. Please contact head office.";
+    if (hub.status === 'Suspended') return `${hub.name} has been suspended, so its logins are paused. Please contact head office.`;
+    if (hub.status !== 'Active') return `${hub.name} is waiting for approval. You can sign in once head office approves it.`;
+  }
+  return null;
+};
 
 // South African numbers: accepts 082 123 4567, +27 82 123 4567, 27821234567 or 0027 82 123 4567,
 // and stores them in the 10-digit local format (0821234567) used across existing records
@@ -182,13 +207,16 @@ const verifyCode = async (req, res) => {
     if (!record)
       return res.status(400).json({ message: 'Verification code not found' });
 
-    if (record.expiresAt < new Date()) {
+    // Five wrong guesses use the code up
+    if (record.expiresAt < new Date() || (record.attempts || 0) >= 5) {
       await VerificationCode.deleteOne({ email: sanitizedEmail });
       return res.status(400).json({ message: 'Verification code expired' });
     }
 
-    if (record.code !== code.toUpperCase())
+    if (record.code !== code.toUpperCase()) {
+      await VerificationCode.updateOne({ email: sanitizedEmail }, { $inc: { attempts: 1 } });
       return res.status(400).json({ message: 'Invalid verification code' });
+    }
 
     await VerificationCode.deleteOne({ email: sanitizedEmail });
     res.status(200).json({ message: 'Verification successful' });
@@ -222,12 +250,14 @@ const registerUser = async (req, res) => {
     if (!record)
       return res.status(400).json({ message: 'Verification code not found' });
 
-    if (record.expiresAt < new Date()) {
+    // Five wrong guesses use the code up
+    if (record.expiresAt < new Date() || (record.attempts || 0) >= 5) {
       await VerificationCode.deleteOne({ email: sanitizedEmail });
       return res.status(400).json({ message: 'Verification code expired' });
     }
 
     if (record.code !== code.toUpperCase()) {
+      await VerificationCode.updateOne({ email: sanitizedEmail }, { $inc: { attempts: 1 } });
       return res.status(400).json({ message: 'Invalid verification code' });
     }
 
@@ -305,9 +335,8 @@ const loginUser = async (req, res) => {
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(401).json({ message: 'Incorrect email or password.' });
 
-    if (user.role === SALES_REP_ROLE && user.status === 'Disabled') {
-      return res.status(403).json({ message: 'This account has been disabled. Please contact ShipDay.' });
-    }
+    const blocked = await signInBlock(user);
+    if (blocked) return res.status(403).json({ message: blocked });
 
     const token = jwt.sign({ id: user._id, email: user.email, role: user.role || 'Customer' }, process.env.JWT_SECRET, { expiresIn: '2h' });
 
@@ -323,7 +352,7 @@ const loginUser = async (req, res) => {
     res.status(200).json({
       message: 'Login successful',
       token,
-      user: buildAuthUser(user),
+      user: await buildSignedInUser(user),
     });
   } catch (err) {
     console.error(err);
@@ -345,43 +374,62 @@ const logoutUser = async (req, res) => {
   }
 };
 
-//  Reset password
+// Reset password — needs the short-lived link issued after the emailed code is checked
 const resetPassword = async (req, res) => {
-  const { email, newPassword } = req.body;
-  const sanitizedEmail = validateEmail(email);
+  const { newPassword, resetToken } = req.body;
 
-  if (!sanitizedEmail || !newPassword) {
-    return res.status(400).json({ message: 'Valid email and new password are required' });
+  if (!resetToken || !newPassword) {
+    return res.status(400).json({ message: 'Please start again from "Forgot password".' });
   }
+  req.body = { token: resetToken, password: newPassword };
+  return setPassword(req, res);
+};
 
-  if (!strongPasswordRegex.test(newPassword)) {
+// Set a password from an invitation or reset link: POST /api/auth/set-password { token, password }
+const setPassword = async (req, res) => {
+  const { token, password } = req.body;
+  if (!token || !password) return res.status(400).json({ message: 'Choose a password.' });
+  if (!strongPasswordRegex.test(password)) {
     return res.status(400).json({
-      message:
-        'Password must be at least 8 characters and include uppercase, lowercase, number, and special character.',
+      message: 'Password must be at least 8 characters and include uppercase, lowercase, number, and special character.',
     });
   }
 
   try {
-    const user = await User.findOne({ email: sanitizedEmail });
-    if (!user) return res.status(404).json({ message: 'User not found' });
+    const { user, purpose } = await verifyPasswordToken(token);
+    if (user.status === 'Disabled') return res.status(403).json({ message: 'This account has been disabled. Please contact ShipDay.' });
 
-    const hashedPassword = await bcrypt.hash(newPassword, 10);
-    user.password = hashedPassword;
+    user.password = await bcrypt.hash(password, 10);
+    if (!user.invite?.acceptedAt) user.invite = { ...(user.invite || {}), acceptedAt: new Date() };
     await user.save();
-
     await Token.deleteMany({ userId: user._id });
 
     await createNotification(
       user._id,
-      "Password Reset",
-      `Your account password has been successfully reset.`,
-      "forgot-password"
+      purpose === 'invite' ? 'Welcome to ShipDay' : 'Password Reset',
+      purpose === 'invite' ? 'Your password has been set. Welcome aboard.' : 'Your account password has been successfully reset.',
+      'forgot-password'
     );
 
-    res.status(200).json({ message: 'Password reset successful. Please log in again.' });
+    res.status(200).json({
+      message: purpose === 'invite' ? 'Your password is set. You can sign in now.' : 'Password reset successful. Please log in again.',
+      email: user.email,
+    });
   } catch (err) {
-    console.error('Reset error:', err);
-    res.status(500).json({ message: 'Server error during password reset' });
+    if (err instanceof PasswordTokenError) return res.status(400).json({ message: err.message });
+    console.error('Set password error:', err);
+    res.status(500).json({ message: 'Server error while setting your password' });
+  }
+};
+
+// Check an invitation link before showing the form: GET /api/auth/set-password?token=
+const checkPasswordLink = async (req, res) => {
+  try {
+    const { user, purpose } = await verifyPasswordToken(req.query.token);
+    res.json({ email: user.email, fullName: user.fullName || '', role: user.role, purpose });
+  } catch (err) {
+    if (err instanceof PasswordTokenError) return res.status(400).json({ message: err.message });
+    res.status(500).json({ message: 'Server error' });
   }
 };
 
@@ -602,9 +650,12 @@ const saveUserLocation = async (req, res) => {
 const getUserByEmail = async (req, res) => {
   const sanitizedEmail = validateEmail(req.query.email);
   if (!sanitizedEmail) return res.status(400).json({ message: 'Valid email is required' });
+  if (!isStaff(req.user) && sanitizedEmail.toLowerCase() !== req.user.email.toLowerCase()) {
+    return res.status(403).json({ message: 'You can only view your own account.' });
+  }
 
   try {
-    const user = await User.findOne({ email: sanitizedEmail }).select('-password -__v');
+    const user = await User.findOne({ email: sanitizedEmail }).select('-password -__v -tokens');
     if (!user) return res.status(404).json({ message: 'User not found' });
 
     res.status(200).json({ user });
@@ -767,8 +818,11 @@ const updateMyProfile = async (req, res) => {
 // Get User by ID
 const getUserById = async (req, res) => {
   const { id } = req.params;
+  if (!isStaff(req.user) && String(req.user._id) !== String(id)) {
+    return res.status(403).json({ message: 'You can only view your own account.' });
+  }
   try {
-    const user = await User.findById(id).select('-password -__v');
+    const user = await User.findById(id).select('-password -__v -tokens');
     if (!user) return res.status(404).json({ message: 'User not found' });
     res.status(200).json({ user });
   } catch (err) {
@@ -809,12 +863,32 @@ const getCustomerById = async (req, res) => {
 
 // Google Login
 const googleLogin = async (req, res) => {
-  const { email, fullName, image, referralCode } = req.body;
-  const sanitizedEmail = validateEmail(email);
-  if (!sanitizedEmail) return res.status(400).json({ message: "Valid email is required" });
+  const { accessToken, referralCode } = req.body;
+
+  // Who is signing in comes from Google, never from the request body
+  let googleProfile;
+  try {
+    googleProfile = await verifyGoogleAccessToken(accessToken);
+  } catch (err) {
+    if (!(err instanceof GoogleAuthError)) console.error('Google token check failed:', err.message);
+    return res.status(err.status || 401).json({ message: err instanceof GoogleAuthError ? err.message : 'Google sign-in failed. Please try again.' });
+  }
+  const { fullName, image } = googleProfile;
+  const sanitizedEmail = validateEmail(googleProfile.email);
+  if (!sanitizedEmail) return res.status(400).json({ message: "Your Google account has no usable email address" });
 
   try {
     let user = await User.findOne({ email: sanitizedEmail });
+
+    if (user) {
+      const blocked = await signInBlock(user);
+      if (blocked) return res.status(403).json({ message: blocked });
+      // Google has confirmed the email, so an invited team member is now set up
+      if (user.createdBy && !user.invite?.acceptedAt) {
+        user.invite = { ...(user.invite || {}), acceptedAt: new Date() };
+        await user.save();
+      }
+    }
 
     const base64Image = await convertImageToBase64(image);
 
@@ -825,7 +899,7 @@ const googleLogin = async (req, res) => {
         fullName,
         image: base64Image,
         customerId,
-        password: await bcrypt.hash(Math.random().toString(36), 10),
+        password: await bcrypt.hash(require('crypto').randomBytes(24).toString('hex'), 10),
         profileCompleted: false,
       });
       // Referral links only count for brand-new accounts
@@ -853,7 +927,7 @@ const googleLogin = async (req, res) => {
     res.status(200).json({
       message: "Google login successful",
       token,
-      user: buildAuthUser(user),
+      user: await buildSignedInUser(user),
     });
   } catch (err) {
     console.error("Google login error:", err);
@@ -976,6 +1050,10 @@ module.exports = {
   loginUser,
   logoutUser,
   resetPassword,
+  setPassword,
+  checkPasswordLink,
+  signPasswordToken,
+  signInBlock,
   updateUserProfile,
   completeProfileSetup,
   getMyProfile,

@@ -13,6 +13,7 @@ const vehicleSchema = new mongoose.Schema({
     ref: "Staff",
   },
   status: { type: String, enum: ["Active", "Inactive", "Maintenance"], default: "Active" },
+  hub: { type: mongoose.Schema.Types.ObjectId, ref: "Hub", default: null },
 }, { timestamps: true });
 
 module.exports = mongoose.model("Vehicle", vehicleSchema);

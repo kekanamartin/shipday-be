@@ -86,8 +86,8 @@ router.get('/shipments', authMiddleware, verifyAdmin, getAllShipments);
 router.post('/shipments', authMiddleware, verifyAdmin, createShipment);
 router.get('/shipments/:shipmentId', authMiddleware, verifyAdmin, getShipmentById);
 router.delete('/shipments/:shipmentId', authMiddleware, verifyAdmin, deleteShipment);
-router.get('/shipments/:shipmentId/waybill', downloadWaybill);
-router.get('/shipments/:shipmentId/pod', downloadPOD);
+router.get('/shipments/:shipmentId/waybill', authMiddleware, downloadWaybill);
+router.get('/shipments/:shipmentId/pod', authMiddleware, downloadPOD);
 
 // Order status management
 router.get('/orders/statuses', authMiddleware, verifyAdmin, getOrderStatuses);

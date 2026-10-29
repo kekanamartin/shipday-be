@@ -1,5 +1,8 @@
 const Transaction = require("../models/Transaction");
 const { v4: uuidv4 } = require("uuid");
+const { isStaff, isHubUser, loadPermissions } = require("../middleware/access");
+
+const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 // controllers/transactionController.js
 
@@ -40,45 +43,15 @@ exports.createTransaction = async (req, res) => {
 exports.getAllTransactions = async (req, res) => {
   try {
     let query = {};
-    if (req.user && req.user.role === 'Customer') {
-      // Combine all possible identifiers: Name, Company, CustomerID, Email
-      const identifiers = [
-        req.user.fullName,
-        req.user.companyName,
-        req.user.customerId,
-        req.user.email
-      ].filter(Boolean);
-
-      // Split names but keep IDs/Emails whole if possible, simplify by splitting all string parts
-      // Actually, for ID 'CUST001', splitting by space is fine (it has no space).
-      // For email, we might want to split or keep whole. Let's keep whole first then split names.
-
-      const searchTerms = [];
-      // Add exact identifiers first
-      identifiers.forEach(id => searchTerms.push(id));
-      // Add name parts
-      if (req.user.fullName) {
-        req.user.fullName.split(' ').forEach(part => {
-          if (part.length > 2) searchTerms.push(part);
-        });
-      }
-
-      // Deduplicate
-      const uniqueTerms = [...new Set(searchTerms)];
-
-      const regexConditions = uniqueTerms.map(term => ({
-        customer: { $regex: new RegExp(term, 'i') }
-      }));
-
-      query['$or'] = [
-        { userId: req.user._id },
-        ...regexConditions
-      ];
-
-      // Fallback
-      if (query['$or'].length === 0) {
-        query.customer = { $regex: new RegExp(req.user.fullName || 'impossible_match', 'i') };
-      }
+    const seesAll = isStaff(req.user)
+      || (!isHubUser(req.user) && (await loadPermissions(req)).includes('transactions.view'));
+    if (!seesAll) {
+      // Your own transactions only: linked to your account, or older records
+      // that carry only your email or customer ID as the customer name
+      const exact = [req.user.email, req.user.customerId]
+        .filter(Boolean)
+        .map((value) => ({ customer: { $regex: `^${escapeRegex(value)}$`, $options: 'i' } }));
+      query = { $or: [{ userId: req.user._id }, ...exact] };
     }
     const transactions = await Transaction.find(query).sort({ date: -1 });
     res.status(200).json(transactions);

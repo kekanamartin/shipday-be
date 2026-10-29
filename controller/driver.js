@@ -66,7 +66,7 @@ const sendVerificationCode = async (email) => {
 
   await VerificationCode.findOneAndUpdate(
     { email },
-    { code, expiresAt },
+    { code, expiresAt, attempts: 0 },
     { upsert: true, new: true }
   );
 
@@ -102,12 +102,13 @@ const requestDriverVerificationCode = async (req, res) => {
       return res.status(400).json({ message: 'Verification code not found' });
     }
 
-    if (record.expiresAt < new Date()) {
+    if (record.expiresAt < new Date() || (record.attempts || 0) >= 5) {
       await VerificationCode.deleteOne({ email: sanitizedEmail });
       return res.status(400).json({ message: 'Verification code expired' });
     }
 
-    if (record.code !== code) {
+    if (record.code !== String(code).trim().toUpperCase()) {
+      await VerificationCode.updateOne({ email: sanitizedEmail }, { $inc: { attempts: 1 } });
       return res.status(400).json({ message: 'Invalid verification code' });
     }
 
@@ -261,7 +262,7 @@ const loginDriver = async (req, res) => {
     const token = jwt.sign(
       { id: driver._id, email: driver.email, role: 'driver' },
       process.env.JWT_SECRET,
-      { expiresIn: '2h' }
+      { expiresIn: process.env.DRIVER_TOKEN_TTL || '7d' } // the app stays signed in between shifts
     );
 
 
@@ -502,8 +503,10 @@ const updateShipmentStatus = async (req, res) => {
       updateFields.deliveredAt = new Date();
     }
 
+    // A signed-in driver may only update deliveries assigned to them
+    const filter = req.driver ? { shipmentId, driver: req.driver._id } : { shipmentId };
     const shipment = await Shipment.findOneAndUpdate(
-      { shipmentId },
+      filter,
       updateFields,
       { new: true }
     );
@@ -618,7 +621,7 @@ const updateShipmentStatusWithPOD = async (req, res) => {
       return res.status(404).json({ message: 'Shipment not found. Tried: ' + shipmentId });
     }
     // Verify shipment belongs to this driver
-    if (shipment.driver && shipment.driver.toString() !== driver._id.toString()) {
+    if (!shipment.driver || shipment.driver.toString() !== driver._id.toString()) {
       return res.status(403).json({ message: 'Shipment not assigned to this driver' });
     }
     shipment = await Shipment.findByIdAndUpdate(shipment._id, updateFields, { new: true });
@@ -763,12 +766,13 @@ const resetPassword = async (req, res) => {
       return res.status(400).json({ message: 'Verification code not found' });
     }
 
-    if (record.expiresAt < new Date()) {
+    if (record.expiresAt < new Date() || (record.attempts || 0) >= 5) {
       await VerificationCode.deleteOne({ email: sanitizedEmail });
       return res.status(400).json({ message: 'Verification code expired' });
     }
 
-    if (record.code !== code) {
+    if (record.code !== String(code).trim().toUpperCase()) {
+      await VerificationCode.updateOne({ email: sanitizedEmail }, { $inc: { attempts: 1 } });
       return res.status(400).json({ message: 'Invalid verification code' });
     }
 

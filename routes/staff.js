@@ -19,21 +19,24 @@ const {
 
 const authMiddleware = require("../middleware/authMiddleware");
 const { verifySuperAdmin } = require("../middleware/roleMiddleware");
+const { requireRoles, STAFF } = require("../middleware/access");
 
-router.post("/add", addNewStaff);
-router.get("/all", getAllStaff);
-router.post("/assign-task/:staffId", assignTaskToStaff);
-router.get("/:id/tasks", getAssignedTasks);
-router.put("/:staffId/update-task/:routeId", updateRoute);
-router.put("/update/:id", authMiddleware, verifySuperAdmin, updateStaff); //  Protected
-router.delete("/delete/:id", authMiddleware, verifySuperAdmin, deleteStaff); // Protected
+router.use(authMiddleware);
 
-router.delete("/:staffId/remove-task/:routeId", deleteRoute);
+router.post("/add", requireRoles(STAFF), addNewStaff);
+router.get("/all", requireRoles(STAFF), getAllStaff);
+router.post("/assign-task/:staffId", requireRoles(STAFF), assignTaskToStaff);
+router.get("/:id/tasks", requireRoles(STAFF), getAssignedTasks);
+router.put("/:staffId/update-task/:routeId", requireRoles(STAFF), updateRoute);
+router.put("/update/:id", verifySuperAdmin, updateStaff); //  Protected
+router.delete("/delete/:id", verifySuperAdmin, deleteStaff); // Protected
+
+router.delete("/:staffId/remove-task/:routeId", requireRoles(STAFF), deleteRoute);
 
 
-router.get("/grouped-routes", getRoutesGroupedByStaff); //  NEW ENDPOINT
-router.get("/driver-by-route", getDriverByRoute);
-router.get("/driver-by-name", getDriverByName); //  NEW ENDPOINT
+router.get("/grouped-routes", requireRoles(STAFF), getRoutesGroupedByStaff); //  NEW ENDPOINT
+router.get("/driver-by-route", requireRoles(STAFF), getDriverByRoute);
+router.get("/driver-by-name", requireRoles(STAFF), getDriverByName); //  NEW ENDPOINT
 
 
 
